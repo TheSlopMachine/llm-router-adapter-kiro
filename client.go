@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -14,7 +16,25 @@ import (
 	sdk "github.com/TheSlopMachine/llm-router-sdk"
 )
 
-const socialRefreshURL = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
+const (
+	socialAuthServiceURL = "https://prod.us-east-1.auth.desktop.kiro.dev"
+	socialRefreshURL     = socialAuthServiceURL + "/refreshToken"
+	socialTokenURL       = socialAuthServiceURL + "/oauth/token"
+	kiroBuilderStartURL  = "https://view.awsapps.com/start"
+	kiroIssuerURL        = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
+)
+
+var (
+	kiroScopes = []string{
+		"codewhisperer:completions",
+		"codewhisperer:analysis",
+		"codewhisperer:conversations",
+	}
+	kiroGrantTypes = []string{
+		"urn:ietf:params:oauth:grant-type:device_code",
+		"refresh_token",
+	}
+)
 
 type Client struct {
 	httpClient *http.Client
@@ -24,6 +44,153 @@ func NewClient() *Client {
 	return &Client{
 		httpClient: &http.Client{},
 	}
+}
+
+func (c *Client) RegisterClient(ctx context.Context, region string) (*clientRegistrationResponse, error) {
+	if strings.TrimSpace(region) == "" {
+		region = defaultRegion
+	}
+	endpoint := fmt.Sprintf("https://oidc.%s.amazonaws.com/client/register", region)
+	payload := map[string]any{
+		"clientName": "kiro-oauth-client",
+		"clientType": "public",
+		"scopes":     kiroScopes,
+		"grantTypes": kiroGrantTypes,
+		"issuerUrl":  kiroIssuerURL,
+	}
+
+	var out clientRegistrationResponse
+	if err := c.postJSON(ctx, endpoint, payload, &out); err != nil {
+		return nil, err
+	}
+	if out.ClientID == "" || out.ClientSecret == "" {
+		return nil, fmt.Errorf("kiro: client registration response was incomplete")
+	}
+	return &out, nil
+}
+
+func (c *Client) StartDeviceAuthorization(
+	ctx context.Context,
+	clientID, clientSecret, startURL, region string,
+) (*deviceAuthorizationResponse, error) {
+	if strings.TrimSpace(region) == "" {
+		region = defaultRegion
+	}
+	endpoint := fmt.Sprintf("https://oidc.%s.amazonaws.com/device_authorization", region)
+	payload := map[string]string{
+		"clientId":     clientID,
+		"clientSecret": clientSecret,
+		"startUrl":     startURL,
+	}
+
+	var out deviceAuthorizationResponse
+	if err := c.postJSON(ctx, endpoint, payload, &out); err != nil {
+		return nil, err
+	}
+	if out.Interval <= 0 {
+		out.Interval = 5
+	}
+	if out.DeviceCode == "" || out.UserCode == "" {
+		return nil, fmt.Errorf("kiro: device authorization response was incomplete")
+	}
+	return &out, nil
+}
+
+func (c *Client) PollDeviceToken(
+	ctx context.Context,
+	clientID, clientSecret, deviceCode, region string,
+) (*devicePollResult, error) {
+	if strings.TrimSpace(region) == "" {
+		region = defaultRegion
+	}
+	endpoint := fmt.Sprintf("https://oidc.%s.amazonaws.com/token", region)
+	payload := map[string]string{
+		"clientId":     clientID,
+		"clientSecret": clientSecret,
+		"deviceCode":   deviceCode,
+		"grantType":    "urn:ietf:params:oauth:grant-type:device_code",
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("kiro: marshal device token request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("kiro: create device token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("kiro: device token request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("kiro: read device token response: %w", err)
+	}
+
+	var parsed deviceTokenResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return nil, fmt.Errorf("kiro: parse device token response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK || parsed.Error != "" {
+		if parsed.Error == "authorization_pending" || parsed.Error == "slow_down" {
+			message := parsed.ErrorDescription
+			if message == "" {
+				message = parsed.Error
+			}
+			return &devicePollResult{Pending: true, ErrorDescription: message}, nil
+		}
+		if parsed.ErrorDescription != "" {
+			return nil, fmt.Errorf("kiro: %s", parsed.ErrorDescription)
+		}
+		return nil, fmt.Errorf("kiro: device login failed")
+	}
+
+	return &devicePollResult{
+		AccessToken:  parsed.AccessToken,
+		RefreshToken: parsed.RefreshToken,
+		ExpiresIn:    parsed.ExpiresIn,
+	}, nil
+}
+
+func (c *Client) BuildSocialLoginURL(provider, codeChallenge, state string) string {
+	idp := "Google"
+	if provider == authMethodGitHub {
+		idp = "Github"
+	}
+	redirectURI := "kiro://kiro.kiroAgent/authenticate-success"
+	return fmt.Sprintf(
+		"%s/login?idp=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=%s&prompt=select_account",
+		socialAuthServiceURL,
+		idp,
+		urlQueryEscape(redirectURI),
+		urlQueryEscape(codeChallenge),
+		urlQueryEscape(state),
+	)
+}
+
+func (c *Client) ExchangeSocialCode(ctx context.Context, code, codeVerifier string) (*tokenRefreshResponse, error) {
+	payload := map[string]string{
+		"code":          code,
+		"code_verifier": codeVerifier,
+		"redirect_uri":  "kiro://kiro.kiroAgent/authenticate-success",
+	}
+
+	var out tokenRefreshResponse
+	if err := c.postJSON(ctx, socialTokenURL, payload, &out); err != nil {
+		return nil, err
+	}
+	if out.AccessToken == "" {
+		return nil, fmt.Errorf("kiro: token exchange did not return an access token")
+	}
+	return &out, nil
 }
 
 func (c *Client) Generate(
@@ -103,13 +270,46 @@ func (c *Client) GenerateStream(
 }
 
 func (c *Client) ValidateImportToken(ctx context.Context, refreshToken string) (*tokenRefreshResponse, error) {
-	if !strings.HasPrefix(refreshToken, "aor") {
-		return nil, fmt.Errorf("Kiro refresh token should usually start with \"aor\"")
+	if !strings.HasPrefix(refreshToken, "aorAAAAAG") {
+		return nil, fmt.Errorf("Kiro refresh token should start with \"aorAAAAAG\"")
 	}
 	return c.RefreshCredential(ctx, map[string]string{
 		refreshTokenField: refreshToken,
 		authMethodField:   "imported",
 	})
+}
+
+func findLocalRefreshToken() (string, string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("kiro: failed to resolve user home directory")
+	}
+
+	cacheDir := filepath.Join(home, ".aws", "sso", "cache")
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return "", "", fmt.Errorf("kiro: AWS SSO cache not found at %s", cacheDir)
+	}
+
+	preferred := []string{"kiro-auth-token.json", "amazon-q-auth-token.json"}
+	for _, name := range preferred {
+		token, source := tokenFromEntry(cacheDir, entries, name)
+		if token != "" {
+			return token, source, nil
+		}
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		token, source := readRefreshTokenFile(filepath.Join(cacheDir, entry.Name()))
+		if token != "" {
+			return token, source, nil
+		}
+	}
+
+	return "", "", fmt.Errorf("kiro: no Kiro refresh token found in %s", cacheDir)
 }
 
 func (c *Client) RefreshCredential(ctx context.Context, credData map[string]string) (*tokenRefreshResponse, error) {
@@ -184,6 +384,33 @@ func (c *Client) RefreshCredential(ctx context.Context, credData map[string]stri
 	return &refreshed, nil
 }
 
+func tokenFromEntry(cacheDir string, entries []os.DirEntry, target string) (string, string) {
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Name() != target {
+			continue
+		}
+		return readRefreshTokenFile(filepath.Join(cacheDir, entry.Name()))
+	}
+	return "", ""
+}
+
+func readRefreshTokenFile(path string) (string, string) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+	var payload struct {
+		RefreshToken string `json:"refreshToken"`
+	}
+	if err := json.Unmarshal(content, &payload); err != nil {
+		return "", ""
+	}
+	if strings.HasPrefix(payload.RefreshToken, "aorAAAAAG") {
+		return payload.RefreshToken, path
+	}
+	return "", ""
+}
+
 func (c *Client) doGenerateRequest(
 	ctx context.Context,
 	cred *sdk.Credential,
@@ -220,6 +447,38 @@ func (c *Client) doGenerateRequest(
 	httpReq.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
 
 	return c.httpClient.Do(httpReq)
+}
+
+func (c *Client) postJSON(ctx context.Context, endpoint string, payload any, out any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("kiro: marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("kiro: create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("kiro: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("kiro: read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return parseKiroError(resp.StatusCode, resp.Header, respBody)
+	}
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return fmt.Errorf("kiro: parse response: %w", err)
+	}
+	return nil
 }
 
 func parseKiroError(statusCode int, headers http.Header, body []byte) error {
@@ -307,4 +566,30 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func urlQueryEscape(value string) string {
+	replacer := strings.NewReplacer(
+		"%", "%25",
+		" ", "%20",
+		"!", "%21",
+		"\"", "%22",
+		"#", "%23",
+		"$", "%24",
+		"&", "%26",
+		"'", "%27",
+		"(", "%28",
+		")", "%29",
+		"+", "%2B",
+		",", "%2C",
+		"/", "%2F",
+		":", "%3A",
+		";", "%3B",
+		"=", "%3D",
+		"?", "%3F",
+		"@", "%40",
+		"[", "%5B",
+		"]", "%5D",
+	)
+	return replacer.Replace(value)
 }

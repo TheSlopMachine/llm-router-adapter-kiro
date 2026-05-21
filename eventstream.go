@@ -1,0 +1,296 @@
+package kiro
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	sdk "github.com/TheSlopMachine/llm-router-sdk"
+)
+
+type eventFrame struct {
+	headers map[string]string
+	payload map[string]any
+}
+
+type aggregateState struct {
+	content           strings.Builder
+	promptTokens      int
+	completionTokens  int
+	totalTokens       int
+	finishReason      string
+	totalContentBytes int
+}
+
+func parseEventStreamResponse(body []byte) (*aggregateState, error) {
+	state := &aggregateState{}
+	for len(body) >= 16 {
+		totalLength := int(binary.BigEndian.Uint32(body[0:4]))
+		if totalLength < 16 || totalLength > len(body) {
+			break
+		}
+
+		frame, err := parseEventFrame(body[:totalLength])
+		if err == nil {
+			consumeAggregateEvent(state, frame)
+		}
+		body = body[totalLength:]
+	}
+	return state, nil
+}
+
+func streamEventStreamToSSE(
+	ctx context.Context,
+	body io.Reader,
+	w io.Writer,
+	modelID string,
+) error {
+	responseID := fmt.Sprintf("kiro-%d", time.Now().UnixNano())
+	created := time.Now().Unix()
+	buffer := make([]byte, 0, 32*1024)
+	tmp := make([]byte, 8*1024)
+	finishReason := "stop"
+	firstChunk := true
+
+	flush := func() {
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		n, err := body.Read(tmp)
+		if n > 0 {
+			buffer = append(buffer, tmp[:n]...)
+			for len(buffer) >= 16 {
+				totalLength := int(binary.BigEndian.Uint32(buffer[0:4]))
+				if totalLength < 16 || totalLength > len(buffer) {
+					break
+				}
+
+				frame, parseErr := parseEventFrame(buffer[:totalLength])
+				buffer = buffer[totalLength:]
+				if parseErr != nil {
+					continue
+				}
+
+				eventType := frame.headers[":event-type"]
+				switch eventType {
+				case "assistantResponseEvent", "codeEvent":
+					content := payloadString(frame.payload, "content")
+					if content == "" {
+						continue
+					}
+
+					chunk := sdk.StreamChunk{
+						ID:      responseID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   modelID,
+						Choices: []sdk.StreamChunkChoice{
+							{
+								Index: 0,
+								Delta: sdk.ChatMessage{
+									Role:    "assistant",
+									Content: content,
+								},
+								FinishReason: nil,
+							},
+						},
+					}
+					if !firstChunk {
+						chunk.Choices[0].Delta.Role = ""
+					}
+					firstChunk = false
+
+					data, marshalErr := json.Marshal(chunk)
+					if marshalErr != nil {
+						return fmt.Errorf("kiro: marshal stream chunk: %w", marshalErr)
+					}
+					if _, writeErr := fmt.Fprintf(w, "data: %s\n\n", data); writeErr != nil {
+						return writeErr
+					}
+					flush()
+				case "messageStopEvent":
+					finishReason = "stop"
+				}
+			}
+		}
+
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("kiro: read event stream: %w", err)
+		}
+	}
+
+	finalChunk := sdk.StreamChunk{
+		ID:      responseID,
+		Object:  "chat.completion.chunk",
+		Created: created,
+		Model:   modelID,
+		Choices: []sdk.StreamChunkChoice{
+			{
+				Index:        0,
+				Delta:        sdk.ChatMessage{},
+				FinishReason: &finishReason,
+			},
+		},
+	}
+
+	data, err := json.Marshal(finalChunk)
+	if err != nil {
+		return fmt.Errorf("kiro: marshal final chunk: %w", err)
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	flush()
+	return nil
+}
+
+func parseEventFrame(frame []byte) (*eventFrame, error) {
+	if len(frame) < 16 {
+		return nil, fmt.Errorf("frame too short")
+	}
+
+	totalLength := binary.BigEndian.Uint32(frame[0:4])
+	headersLength := binary.BigEndian.Uint32(frame[4:8])
+	if int(totalLength) != len(frame) {
+		return nil, fmt.Errorf("frame length mismatch")
+	}
+
+	preludeCRC := binary.BigEndian.Uint32(frame[8:12])
+	if crc32.ChecksumIEEE(frame[0:8]) != preludeCRC {
+		return nil, fmt.Errorf("invalid prelude crc")
+	}
+
+	messageCRC := binary.BigEndian.Uint32(frame[len(frame)-4:])
+	if crc32.ChecksumIEEE(frame[:len(frame)-4]) != messageCRC {
+		return nil, fmt.Errorf("invalid message crc")
+	}
+
+	headerEnd := 12 + int(headersLength)
+	if headerEnd > len(frame)-4 {
+		return nil, fmt.Errorf("invalid header length")
+	}
+
+	headers := make(map[string]string)
+	offset := 12
+	for offset < headerEnd {
+		nameLen := int(frame[offset])
+		offset++
+		if offset+nameLen > headerEnd {
+			return nil, fmt.Errorf("invalid header name")
+		}
+		name := string(frame[offset : offset+nameLen])
+		offset += nameLen
+
+		if offset >= headerEnd {
+			return nil, fmt.Errorf("invalid header type")
+		}
+		valueType := frame[offset]
+		offset++
+		if valueType != 7 {
+			return nil, fmt.Errorf("unsupported header type %d", valueType)
+		}
+		if offset+2 > headerEnd {
+			return nil, fmt.Errorf("invalid header value length")
+		}
+		valueLen := int(binary.BigEndian.Uint16(frame[offset : offset+2]))
+		offset += 2
+		if offset+valueLen > headerEnd {
+			return nil, fmt.Errorf("invalid header value")
+		}
+		headers[name] = string(frame[offset : offset+valueLen])
+		offset += valueLen
+	}
+
+	payloadStart := headerEnd
+	payloadEnd := len(frame) - 4
+	payload := make(map[string]any)
+	if payloadEnd > payloadStart {
+		raw := strings.TrimSpace(string(frame[payloadStart:payloadEnd]))
+		if raw != "" {
+			if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+				return &eventFrame{headers: headers, payload: map[string]any{"raw": raw}}, nil
+			}
+		}
+	}
+
+	return &eventFrame{
+		headers: headers,
+		payload: payload,
+	}, nil
+}
+
+func consumeAggregateEvent(state *aggregateState, frame *eventFrame) {
+	switch frame.headers[":event-type"] {
+	case "assistantResponseEvent", "codeEvent":
+		content := payloadString(frame.payload, "content")
+		if content == "" {
+			return
+		}
+		state.content.WriteString(content)
+		state.totalContentBytes += len(content)
+	case "metricsEvent":
+		metricsSource := frame.payload
+		if nested, ok := frame.payload["metricsEvent"].(map[string]any); ok {
+			metricsSource = nested
+		}
+		state.promptTokens = payloadInt(metricsSource, "inputTokens")
+		state.completionTokens = payloadInt(metricsSource, "outputTokens")
+		state.totalTokens = state.promptTokens + state.completionTokens
+	case "messageStopEvent":
+		state.finishReason = "stop"
+	}
+}
+
+func payloadString(payload map[string]any, key string) string {
+	if payload == nil {
+		return ""
+	}
+	value, ok := payload[key]
+	if !ok {
+		return ""
+	}
+	str, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return str
+}
+
+func payloadInt(payload map[string]any, key string) int {
+	if payload == nil {
+		return 0
+	}
+	value, ok := payload[key]
+	if !ok {
+		return 0
+	}
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	default:
+		return 0
+	}
+}

@@ -10,8 +10,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	sdk "github.com/TheSlopMachine/llm-router-sdk"
 )
 
 type eventFrame struct {
@@ -26,6 +24,20 @@ type aggregateState struct {
 	totalTokens       int
 	finishReason      string
 	totalContentBytes int
+}
+
+type streamChunkPayload struct {
+	ID      string               `json:"id"`
+	Object  string               `json:"object"`
+	Created int64                `json:"created"`
+	Model   string               `json:"model"`
+	Choices []streamChunkChoice  `json:"choices"`
+}
+
+type streamChunkChoice struct {
+	Index        int               `json:"index"`
+	Delta        map[string]string `json:"delta"`
+	FinishReason *string           `json:"finish_reason"`
 }
 
 func parseEventStreamResponse(body []byte) (*aggregateState, error) {
@@ -94,24 +106,25 @@ func streamEventStreamToSSE(
 						continue
 					}
 
-					chunk := sdk.StreamChunk{
+					delta := map[string]string{
+						"content": content,
+					}
+					if firstChunk {
+						delta["role"] = "assistant"
+					}
+
+					chunk := streamChunkPayload{
 						ID:      responseID,
 						Object:  "chat.completion.chunk",
 						Created: created,
 						Model:   modelID,
-						Choices: []sdk.StreamChunkChoice{
+						Choices: []streamChunkChoice{
 							{
 								Index: 0,
-								Delta: sdk.ChatMessage{
-									Role:    "assistant",
-									Content: content,
-								},
+								Delta: delta,
 								FinishReason: nil,
 							},
 						},
-					}
-					if !firstChunk {
-						chunk.Choices[0].Delta.Role = ""
 					}
 					firstChunk = false
 
@@ -137,15 +150,15 @@ func streamEventStreamToSSE(
 		}
 	}
 
-	finalChunk := sdk.StreamChunk{
+	finalChunk := streamChunkPayload{
 		ID:      responseID,
 		Object:  "chat.completion.chunk",
 		Created: created,
 		Model:   modelID,
-		Choices: []sdk.StreamChunkChoice{
+		Choices: []streamChunkChoice{
 			{
 				Index:        0,
-				Delta:        sdk.ChatMessage{},
+				Delta:        map[string]string{},
 				FinishReason: &finishReason,
 			},
 		},

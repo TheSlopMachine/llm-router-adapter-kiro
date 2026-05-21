@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	kiroBuilderStartURL  = "https://view.awsapps.com/start"
-	kiroIssuerURL        = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
+	kiroBuilderStartURL = "https://view.awsapps.com/start"
+	kiroIssuerURL       = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
 )
 
 var (
@@ -196,8 +196,9 @@ func (c *Client) Generate(
 			{
 				Index: 0,
 				Message: sdk.ChatMessage{
-					Role:    "assistant",
-					Content: state.content.String(),
+					Role:      "assistant",
+					Content:   state.content.String(),
+					ToolCalls: state.toolCalls,
 				},
 				FinishReason: state.finishReason,
 			},

@@ -22,13 +22,50 @@ type conversationEntry struct {
 }
 
 type userInputMessage struct {
-	Content string `json:"content"`
-	ModelID string `json:"modelId"`
-	Origin  string `json:"origin,omitempty"`
+	Content                 string                   `json:"content"`
+	ModelID                 string                   `json:"modelId"`
+	Origin                  string                   `json:"origin,omitempty"`
+	UserInputMessageContext *userInputMessageContext `json:"userInputMessageContext,omitempty"`
 }
 
 type assistantResponseMessage struct {
-	Content string `json:"content"`
+	Content  string    `json:"content"`
+	ToolUses []toolUse `json:"toolUses,omitempty"`
+}
+
+type userInputMessageContext struct {
+	ToolResults []toolResult `json:"toolResults,omitempty"`
+	Tools       []toolSpec   `json:"tools,omitempty"`
+}
+
+type toolSpec struct {
+	ToolSpecification toolSpecification `json:"toolSpecification"`
+}
+
+type toolSpecification struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema inputSchemaBody `json:"inputSchema"`
+}
+
+type inputSchemaBody struct {
+	JSON map[string]any `json:"json"`
+}
+
+type toolUse struct {
+	ToolUseID string         `json:"toolUseId"`
+	Name      string         `json:"name"`
+	Input     map[string]any `json:"input"`
+}
+
+type toolResult struct {
+	ToolUseID string              `json:"toolUseId"`
+	Status    string              `json:"status"`
+	Content   []toolResultContent `json:"content"`
+}
+
+type toolResultContent struct {
+	Text string `json:"text"`
 }
 
 type inferenceConfig struct {

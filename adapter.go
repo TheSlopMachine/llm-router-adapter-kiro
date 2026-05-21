@@ -26,6 +26,8 @@ const (
 	clientIDField     = "client_id"
 	clientSecretField = "client_secret"
 	regionField       = "region"
+
+	kiroConversationNamespace = "34f7193f-561d-4050-bc84-9547d953d6bf"
 )
 
 func init() {

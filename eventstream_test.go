@@ -55,6 +55,42 @@ func TestStreamEventStreamToSSEOmitEmptyRole(t *testing.T) {
 	}
 }
 
+func TestStreamEventStreamToSSEEmitsToolCalls(t *testing.T) {
+	body := bytes.NewBuffer(nil)
+	body.Write(mustEventFrame(t, "toolUseEvent", map[string]any{
+		"toolUseId": "call_1",
+		"name":      "TodoWrite",
+		"input": map[string]any{
+			"items": []string{"a"},
+		},
+	}))
+	body.Write(mustEventFrame(t, "messageStopEvent", map[string]any{}))
+
+	var out bytes.Buffer
+	if err := streamEventStreamToSSE(context.Background(), body, &out, "kiro/claude-haiku-4.5"); err != nil {
+		t.Fatalf("streamEventStreamToSSE failed: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("unexpected SSE output: %q", out.String())
+	}
+
+	first := parseChunkLine(t, lines[0])
+	final := parseChunkLine(t, lines[2])
+
+	deltaToolCalls, ok := first.Choices[0].Delta["tool_calls"].([]any)
+	if !ok || len(deltaToolCalls) != 1 {
+		t.Fatalf("expected one tool call delta, got %#v", first.Choices[0].Delta)
+	}
+	if first.Choices[0].Delta["role"] != "assistant" {
+		t.Fatalf("expected first tool delta to include assistant role, got %#v", first.Choices[0].Delta)
+	}
+	if final.Choices[0].FinishReason == nil || *final.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("expected final finish_reason=tool_calls, got %#v", final.Choices[0].FinishReason)
+	}
+}
+
 func parseChunkLine(t *testing.T, line string) streamChunkPayload {
 	t.Helper()
 	if !strings.HasPrefix(line, "data: ") {

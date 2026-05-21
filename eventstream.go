@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	sdk "github.com/TheSlopMachine/llm-router-sdk"
 )
 
 type eventFrame struct {
@@ -24,20 +26,21 @@ type aggregateState struct {
 	totalTokens       int
 	finishReason      string
 	totalContentBytes int
+	toolCalls         []sdk.ChatToolCall
 }
 
 type streamChunkPayload struct {
-	ID      string               `json:"id"`
-	Object  string               `json:"object"`
-	Created int64                `json:"created"`
-	Model   string               `json:"model"`
-	Choices []streamChunkChoice  `json:"choices"`
+	ID      string              `json:"id"`
+	Object  string              `json:"object"`
+	Created int64               `json:"created"`
+	Model   string              `json:"model"`
+	Choices []streamChunkChoice `json:"choices"`
 }
 
 type streamChunkChoice struct {
-	Index        int               `json:"index"`
-	Delta        map[string]string `json:"delta"`
-	FinishReason *string           `json:"finish_reason"`
+	Index        int            `json:"index"`
+	Delta        map[string]any `json:"delta"`
+	FinishReason *string        `json:"finish_reason"`
 }
 
 func parseEventStreamResponse(body []byte) (*aggregateState, error) {
@@ -69,6 +72,8 @@ func streamEventStreamToSSE(
 	tmp := make([]byte, 8*1024)
 	finishReason := "stop"
 	firstChunk := true
+	seenToolCalls := make(map[string]bool)
+	sawToolCall := false
 
 	flush := func() {
 		if flusher, ok := w.(http.Flusher); ok {
@@ -106,7 +111,7 @@ func streamEventStreamToSSE(
 						continue
 					}
 
-					delta := map[string]string{
+					delta := map[string]any{
 						"content": content,
 					}
 					if firstChunk {
@@ -120,8 +125,8 @@ func streamEventStreamToSSE(
 						Model:   modelID,
 						Choices: []streamChunkChoice{
 							{
-								Index: 0,
-								Delta: delta,
+								Index:        0,
+								Delta:        delta,
 								FinishReason: nil,
 							},
 						},
@@ -136,8 +141,58 @@ func streamEventStreamToSSE(
 						return writeErr
 					}
 					flush()
+				case "toolUseEvent":
+					toolCall, ok := extractToolCall(frame.payload)
+					if !ok || seenToolCalls[toolCall.ID] {
+						continue
+					}
+					seenToolCalls[toolCall.ID] = true
+					sawToolCall = true
+
+					delta := map[string]any{
+						"tool_calls": []map[string]any{
+							{
+								"index": 0,
+								"id":    toolCall.ID,
+								"type":  toolCall.Type,
+								"function": map[string]any{
+									"name":      toolCall.Function.Name,
+									"arguments": toolCall.Function.Arguments,
+								},
+							},
+						},
+					}
+					if firstChunk {
+						delta["role"] = "assistant"
+					}
+
+					chunk := streamChunkPayload{
+						ID:      responseID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   modelID,
+						Choices: []streamChunkChoice{
+							{
+								Index:        0,
+								Delta:        delta,
+								FinishReason: nil,
+							},
+						},
+					}
+					firstChunk = false
+
+					data, marshalErr := json.Marshal(chunk)
+					if marshalErr != nil {
+						return fmt.Errorf("kiro: marshal tool stream chunk: %w", marshalErr)
+					}
+					if _, writeErr := fmt.Fprintf(w, "data: %s\n\n", data); writeErr != nil {
+						return writeErr
+					}
+					flush()
 				case "messageStopEvent":
-					finishReason = "stop"
+					if !sawToolCall {
+						finishReason = "stop"
+					}
 				}
 			}
 		}
@@ -150,6 +205,10 @@ func streamEventStreamToSSE(
 		}
 	}
 
+	if sawToolCall {
+		finishReason = "tool_calls"
+	}
+
 	finalChunk := streamChunkPayload{
 		ID:      responseID,
 		Object:  "chat.completion.chunk",
@@ -158,7 +217,7 @@ func streamEventStreamToSSE(
 		Choices: []streamChunkChoice{
 			{
 				Index:        0,
-				Delta:        map[string]string{},
+				Delta:        map[string]any{},
 				FinishReason: &finishReason,
 			},
 		},
@@ -270,9 +329,52 @@ func consumeAggregateEvent(state *aggregateState, frame *eventFrame) {
 		state.promptTokens = payloadInt(metricsSource, "inputTokens")
 		state.completionTokens = payloadInt(metricsSource, "outputTokens")
 		state.totalTokens = state.promptTokens + state.completionTokens
+	case "toolUseEvent":
+		if toolCall, ok := extractToolCall(frame.payload); ok {
+			state.toolCalls = append(state.toolCalls, toolCall)
+			state.finishReason = "tool_calls"
+		}
 	case "messageStopEvent":
-		state.finishReason = "stop"
+		if state.finishReason == "" {
+			state.finishReason = "stop"
+		}
 	}
+}
+
+func extractToolCall(payload map[string]any) (sdk.ChatToolCall, bool) {
+	name := payloadString(payload, "name")
+	if name == "" {
+		return sdk.ChatToolCall{}, false
+	}
+
+	id := payloadString(payload, "toolUseId")
+	if id == "" {
+		id = fmt.Sprintf("call_%d", time.Now().UnixNano())
+	}
+
+	arguments := "{}"
+	if raw, ok := payload["input"]; ok {
+		switch typed := raw.(type) {
+		case string:
+			trimmed := strings.TrimSpace(typed)
+			if trimmed != "" {
+				arguments = trimmed
+			}
+		default:
+			if marshaled, err := json.Marshal(typed); err == nil {
+				arguments = string(marshaled)
+			}
+		}
+	}
+
+	return sdk.ChatToolCall{
+		ID:   id,
+		Type: "function",
+		Function: sdk.ChatToolFunction{
+			Name:      name,
+			Arguments: arguments,
+		},
+	}, true
 }
 
 func payloadString(payload map[string]any, key string) string {

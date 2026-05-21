@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -17,9 +15,6 @@ import (
 )
 
 const (
-	socialAuthServiceURL = "https://prod.us-east-1.auth.desktop.kiro.dev"
-	socialRefreshURL     = socialAuthServiceURL + "/refreshToken"
-	socialTokenURL       = socialAuthServiceURL + "/oauth/token"
 	kiroBuilderStartURL  = "https://view.awsapps.com/start"
 	kiroIssuerURL        = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
 )
@@ -160,39 +155,6 @@ func (c *Client) PollDeviceToken(
 	}, nil
 }
 
-func (c *Client) BuildSocialLoginURL(provider, codeChallenge, state string) string {
-	idp := "Google"
-	if provider == "github" {
-		idp = "Github"
-	}
-	redirectURI := "kiro://kiro.kiroAgent/authenticate-success"
-	return fmt.Sprintf(
-		"%s/login?idp=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=%s&prompt=select_account",
-		socialAuthServiceURL,
-		idp,
-		urlQueryEscape(redirectURI),
-		urlQueryEscape(codeChallenge),
-		urlQueryEscape(state),
-	)
-}
-
-func (c *Client) ExchangeSocialCode(ctx context.Context, code, codeVerifier string) (*tokenRefreshResponse, error) {
-	payload := map[string]string{
-		"code":          code,
-		"code_verifier": codeVerifier,
-		"redirect_uri":  "kiro://kiro.kiroAgent/authenticate-success",
-	}
-
-	var out tokenRefreshResponse
-	if err := c.postJSON(ctx, socialTokenURL, payload, &out); err != nil {
-		return nil, err
-	}
-	if out.AccessToken == "" {
-		return nil, fmt.Errorf("kiro: token exchange did not return an access token")
-	}
-	return &out, nil
-}
-
 func (c *Client) Generate(
 	ctx context.Context,
 	cred *sdk.Credential,
@@ -269,49 +231,6 @@ func (c *Client) GenerateStream(
 	return streamEventStreamToSSE(ctx, resp.Body, w, modelID)
 }
 
-func (c *Client) ValidateImportToken(ctx context.Context, refreshToken string) (*tokenRefreshResponse, error) {
-	if !strings.HasPrefix(refreshToken, "aorAAAAAG") {
-		return nil, fmt.Errorf("Kiro refresh token should start with \"aorAAAAAG\"")
-	}
-	return c.RefreshCredential(ctx, map[string]string{
-		refreshTokenField: refreshToken,
-		authMethodField:   "imported",
-	})
-}
-
-func findLocalRefreshToken() (string, string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", "", fmt.Errorf("kiro: failed to resolve user home directory")
-	}
-
-	cacheDir := filepath.Join(home, ".aws", "sso", "cache")
-	entries, err := os.ReadDir(cacheDir)
-	if err != nil {
-		return "", "", fmt.Errorf("kiro: AWS SSO cache not found at %s", cacheDir)
-	}
-
-	preferred := []string{"kiro-auth-token.json", "amazon-q-auth-token.json"}
-	for _, name := range preferred {
-		token, source := tokenFromEntry(cacheDir, entries, name)
-		if token != "" {
-			return token, source, nil
-		}
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		token, source := readRefreshTokenFile(filepath.Join(cacheDir, entry.Name()))
-		if token != "" {
-			return token, source, nil
-		}
-	}
-
-	return "", "", fmt.Errorf("kiro: no Kiro refresh token found in %s", cacheDir)
-}
-
 func (c *Client) RefreshCredential(ctx context.Context, credData map[string]string) (*tokenRefreshResponse, error) {
 	refreshToken := strings.TrimSpace(credData[refreshTokenField])
 	if refreshToken == "" {
@@ -320,31 +239,21 @@ func (c *Client) RefreshCredential(ctx context.Context, credData map[string]stri
 
 	clientID := strings.TrimSpace(credData[clientIDField])
 	clientSecret := strings.TrimSpace(credData[clientSecretField])
+	if clientID == "" || clientSecret == "" {
+		return nil, fmt.Errorf("kiro: missing client credentials for refresh")
+	}
 	region := strings.TrimSpace(credData[regionField])
 	if region == "" {
 		region = defaultRegion
 	}
 
-	var (
-		url  string
-		body []byte
-		err  error
-	)
-
-	if clientID != "" && clientSecret != "" {
-		url = fmt.Sprintf("https://oidc.%s.amazonaws.com/token", region)
-		body, err = json.Marshal(map[string]string{
-			"clientId":     clientID,
-			"clientSecret": clientSecret,
-			"refreshToken": refreshToken,
-			"grantType":    "refresh_token",
-		})
-	} else {
-		url = socialRefreshURL
-		body, err = json.Marshal(map[string]string{
-			"refreshToken": refreshToken,
-		})
-	}
+	url := fmt.Sprintf("https://oidc.%s.amazonaws.com/token", region)
+	body, err := json.Marshal(map[string]string{
+		"clientId":     clientID,
+		"clientSecret": clientSecret,
+		"refreshToken": refreshToken,
+		"grantType":    "refresh_token",
+	})
 	if err != nil {
 		return nil, fmt.Errorf("kiro: marshal refresh request: %w", err)
 	}
@@ -382,33 +291,6 @@ func (c *Client) RefreshCredential(ctx context.Context, credData map[string]stri
 	}
 
 	return &refreshed, nil
-}
-
-func tokenFromEntry(cacheDir string, entries []os.DirEntry, target string) (string, string) {
-	for _, entry := range entries {
-		if entry.IsDir() || entry.Name() != target {
-			continue
-		}
-		return readRefreshTokenFile(filepath.Join(cacheDir, entry.Name()))
-	}
-	return "", ""
-}
-
-func readRefreshTokenFile(path string) (string, string) {
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return "", ""
-	}
-	var payload struct {
-		RefreshToken string `json:"refreshToken"`
-	}
-	if err := json.Unmarshal(content, &payload); err != nil {
-		return "", ""
-	}
-	if strings.HasPrefix(payload.RefreshToken, "aorAAAAAG") {
-		return payload.RefreshToken, path
-	}
-	return "", ""
 }
 
 func (c *Client) doGenerateRequest(

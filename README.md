@@ -28,7 +28,7 @@ Then rebuild `llm-router`.
   "refresh_token": "aorAAAAAG...",
   "expires_at": "2026-05-21T14:30:00Z",
   "profile_arn": "arn:aws:codewhisperer:...",
-  "auth_method": "imported",
+  "auth_method": "builder-id",
   "region": "us-east-1"
 }
 ```

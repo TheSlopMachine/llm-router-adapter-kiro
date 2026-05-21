@@ -35,11 +35,6 @@ Then rebuild `llm-router`.
 
 Only `refresh_token` or `access_token` is required. If a refresh token is present, the adapter rotates access tokens automatically.
 
-## Notes
-
-- The built-in dashboard flow focuses on token import, which fits `llm-router`'s current auth wizard cleanly.
-- The implementation is based on the Kiro integration patterns in OmniRoute, adapted to the `llm-router-sdk`.
-
 ## License
 
 MIT

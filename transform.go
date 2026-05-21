@@ -13,7 +13,7 @@ import (
 func transformRequest(
 	req *sdk.ChatCompletionRequest,
 	modelName string,
-	cred *sdk.Credential,
+	_ *sdk.Credential,
 ) *generateAssistantResponseRequest {
 	history, current := convertMessages(req.Messages, modelName)
 
@@ -48,12 +48,6 @@ func transformRequest(
 		if req.TopP > 0 {
 			topP := req.TopP
 			out.InferenceConfig.TopP = &topP
-		}
-	}
-
-	if cred != nil {
-		if profileARN := strings.TrimSpace(cred.Data[profileARNField]); profileARN != "" {
-			out.ProfileARN = profileARN
 		}
 	}
 

@@ -22,7 +22,6 @@ const (
 	accessTokenField  = "access_token"
 	refreshTokenField = "refresh_token"
 	expiresAtField    = "expires_at"
-	profileARNField   = "profile_arn"
 	authMethodField   = "auth_method"
 	clientIDField     = "client_id"
 	clientSecretField = "client_secret"
@@ -120,9 +119,6 @@ func (a *Adapter) RefreshCredential(ctx context.Context, cred *sdk.Credential) (
 	data[accessTokenField] = refreshed.AccessToken
 	if refreshed.RefreshToken != "" {
 		data[refreshTokenField] = refreshed.RefreshToken
-	}
-	if refreshed.ProfileARN != "" {
-		data[profileARNField] = refreshed.ProfileARN
 	}
 	if refreshed.ExpiresIn > 0 {
 		data[expiresAtField] = time.Now().UTC().Add(time.Duration(refreshed.ExpiresIn) * time.Second).Format(time.RFC3339)

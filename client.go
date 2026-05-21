@@ -449,29 +449,3 @@ func max(a, b int) int {
 	}
 	return b
 }
-
-func urlQueryEscape(value string) string {
-	replacer := strings.NewReplacer(
-		"%", "%25",
-		" ", "%20",
-		"!", "%21",
-		"\"", "%22",
-		"#", "%23",
-		"$", "%24",
-		"&", "%26",
-		"'", "%27",
-		"(", "%28",
-		")", "%29",
-		"+", "%2B",
-		",", "%2C",
-		"/", "%2F",
-		":", "%3A",
-		";", "%3B",
-		"=", "%3D",
-		"?", "%3F",
-		"@", "%40",
-		"[", "%5B",
-		"]", "%5D",
-	)
-	return replacer.Replace(value)
-}

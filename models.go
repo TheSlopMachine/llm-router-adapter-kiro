@@ -2,7 +2,6 @@ package kiro
 
 type generateAssistantResponseRequest struct {
 	ConversationState conversationState `json:"conversationState"`
-	ProfileARN        string            `json:"profileArn,omitempty"`
 	InferenceConfig   *inferenceConfig  `json:"inferenceConfig,omitempty"`
 }
 
@@ -41,7 +40,6 @@ type inferenceConfig struct {
 type tokenRefreshResponse struct {
 	AccessToken  string `json:"accessToken"`
 	RefreshToken string `json:"refreshToken"`
-	ProfileARN   string `json:"profileArn"`
 	ExpiresIn    int    `json:"expiresIn"`
 }
 
@@ -72,7 +70,6 @@ type deviceTokenResponse struct {
 type devicePollResult struct {
 	AccessToken      string
 	RefreshToken     string
-	ProfileARN       string
 	ExpiresIn        int
 	Pending          bool
 	ErrorDescription string

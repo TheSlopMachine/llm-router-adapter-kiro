@@ -182,7 +182,7 @@ func (f *AuthFlow) handlePollDevice(ctx sdk.AuthFlowContext) (sdk.AuthFlowState,
 
 	_ = clearFlowState(ctx)
 	return sdk.AuthFlowState{
-		Credentials: buildCredentialMap(result.AccessToken, result.RefreshToken, result.ProfileARN, state.Method, state.Region, state.ClientID, state.ClientSecret, result.ExpiresIn),
+		Credentials: buildCredentialMap(result.AccessToken, result.RefreshToken, state.Method, state.Region, state.ClientID, state.ClientSecret, result.ExpiresIn),
 	}, nil
 }
 
@@ -191,7 +191,7 @@ func renderStartPage(errorMessage, region, startURL, deviceMethod string) string
 <div class="auth-flow-content">
 	%s
 	<p><strong>Kiro AI Device Login</strong></p>
-	<p>Sign in with the same AWS-backed Kiro login you use in the IDE. Builder ID uses Kiro's default start URL. IAM Identity Center lets you provide your own start URL.</p>
+	<p>Sign in with the same Kiro account you use in the IDE. Both options use device login; Builder ID uses Kiro's default start URL, while IAM Identity Center lets you provide your own start URL.</p>
 
 	<div class="form-group">
 		<label for="%s">Method</label>
@@ -272,16 +272,13 @@ func selectedIf(selected bool) string {
 	return ""
 }
 
-func buildCredentialMap(accessToken, refreshToken, profileARN, authMethod, region, clientID, clientSecret string, expiresIn int) map[string]string {
+func buildCredentialMap(accessToken, refreshToken, authMethod, region, clientID, clientSecret string, expiresIn int) map[string]string {
 	credentials := map[string]string{
 		accessTokenField: accessToken,
 		authMethodField:  authMethod,
 	}
 	if refreshToken != "" {
 		credentials[refreshTokenField] = refreshToken
-	}
-	if profileARN != "" {
-		credentials[profileARNField] = profileARN
 	}
 	if region != "" {
 		credentials[regionField] = region

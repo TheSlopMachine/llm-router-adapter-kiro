@@ -162,7 +162,7 @@ func (c *Client) PollDeviceToken(
 
 func (c *Client) BuildSocialLoginURL(provider, codeChallenge, state string) string {
 	idp := "Google"
-	if provider == authMethodGitHub {
+	if provider == "github" {
 		idp = "Github"
 	}
 	redirectURI := "kiro://kiro.kiroAgent/authenticate-success"

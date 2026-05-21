@@ -5,7 +5,7 @@ Kiro AI adapter for `llm-router`, using Kiro's AWS CodeWhisperer-compatible stre
 ## Features
 
 - OAuth-style credentials with automatic refresh
-- Dashboard auth flow for importing a Kiro refresh token
+- Dashboard device-login flow for AWS Builder ID and AWS IAM Identity Center
 - Non-streaming and streaming chat completions
 - Hardcoded Kiro model catalog fallback
 - AWS EventStream decoding for Kiro responses
@@ -33,7 +33,7 @@ Then rebuild `llm-router`.
 }
 ```
 
-Only `refresh_token` or `access_token` is required. If a refresh token is present, the adapter rotates access tokens automatically.
+The interactive auth flow stores these automatically after device login. If a refresh token is present, the adapter rotates access tokens automatically.
 
 ## License
 

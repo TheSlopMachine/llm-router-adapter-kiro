@@ -209,7 +209,7 @@ func convertMessages(messages []sdk.ChatMessage, tools []sdk.ChatTool, modelName
 	}
 
 	// Detect tool call loops: if the same tool fails repeatedly, abort
-	if err := detectToolLoop(history); err != nil {
+	if err := detectToolLoop(history, &current); err != nil {
 		// Return error by modifying current message to contain the error
 		current.Content = fmt.Sprintf("Tool loop detected: %v. Please try a different approach.", err)
 		// Clear tool results and tools to avoid malformed request
@@ -590,7 +590,7 @@ func isToolError(text string) bool {
 	return false
 }
 
-func detectToolLoop(history []conversationEntry) error {
+func detectToolLoop(history []conversationEntry, current *userInputMessage) error {
 	const maxConsecutiveErrors = 3
 	
 	// Track consecutive tool call errors
@@ -598,6 +598,47 @@ func detectToolLoop(history []conversationEntry) error {
 	var lastToolName string
 	var lastToolInput string
 	
+	// Check current message first (most recent)
+	if current != nil && current.UserInputMessageContext != nil {
+		hasError := false
+		for _, result := range current.UserInputMessageContext.ToolResults {
+			if result.Status == "error" {
+				hasError = true
+				break
+			}
+		}
+		// If current has errors, we need to check if it's part of a loop
+		if hasError {
+			// Look backwards through history to find the tool call that generated this error
+			for i := len(history) - 1; i >= 0; i-- {
+				entry := history[i]
+				if entry.AssistantResponseMessage != nil && len(entry.AssistantResponseMessage.ToolUses) > 0 {
+					for _, toolUse := range entry.AssistantResponseMessage.ToolUses {
+						inputJSON, _ := json.Marshal(toolUse.Input)
+						inputStr := string(inputJSON)
+						
+						if lastToolName == "" {
+							// First tool call we're examining
+							lastToolName = toolUse.Name
+							lastToolInput = inputStr
+							consecutiveErrors = 1
+						} else if toolUse.Name == lastToolName && inputStr == lastToolInput {
+							consecutiveErrors++
+							if consecutiveErrors >= maxConsecutiveErrors {
+								return fmt.Errorf("tool '%s' called %d times with same failing arguments", toolUse.Name, consecutiveErrors)
+							}
+						} else {
+							// Different tool or input, stop checking
+							return nil
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+	
+	// Continue checking history for patterns
 	for i := len(history) - 1; i >= 0; i-- {
 		entry := history[i]
 		
@@ -614,8 +655,12 @@ func detectToolLoop(history []conversationEntry) error {
 					if consecutiveErrors >= maxConsecutiveErrors {
 						return fmt.Errorf("tool '%s' called %d times with same failing arguments", toolUse.Name, consecutiveErrors)
 					}
-				} else {
+				} else if lastToolName != "" {
 					// Different tool or input, reset counter
+					lastToolName = toolUse.Name
+					lastToolInput = inputStr
+					consecutiveErrors = 1
+				} else {
 					lastToolName = toolUse.Name
 					lastToolInput = inputStr
 					consecutiveErrors = 1

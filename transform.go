@@ -212,9 +212,8 @@ func convertMessages(messages []sdk.ChatMessage, tools []sdk.ChatTool, modelName
 	if err := detectToolLoop(history); err != nil {
 		// Return error by modifying current message to contain the error
 		current.Content = fmt.Sprintf("Tool loop detected: %v. Please try a different approach.", err)
-		if current.UserInputMessageContext != nil {
-			current.UserInputMessageContext.Tools = nil
-		}
+		// Clear tool results and tools to avoid malformed request
+		current.UserInputMessageContext = nil
 	}
 
 	return history, current

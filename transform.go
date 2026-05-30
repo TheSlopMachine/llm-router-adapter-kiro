@@ -214,6 +214,15 @@ func convertMessages(messages []sdk.ChatMessage, tools []sdk.ChatTool, modelName
 		current.Content = fmt.Sprintf("Tool loop detected: %v. Please try a different approach.", err)
 		// Clear tool results and tools to avoid malformed request
 		current.UserInputMessageContext = nil
+		
+		// Remove the last assistant message with tool calls from history
+		// to avoid orphaned tool calls without results
+		if len(history) > 0 {
+			last := history[len(history)-1]
+			if last.AssistantResponseMessage != nil && len(last.AssistantResponseMessage.ToolUses) > 0 {
+				history = history[:len(history)-1]
+			}
+		}
 	}
 
 	return history, current

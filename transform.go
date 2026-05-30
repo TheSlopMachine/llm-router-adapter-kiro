@@ -208,23 +208,6 @@ func convertMessages(messages []sdk.ChatMessage, tools []sdk.ChatTool, modelName
 		}
 	}
 
-	// Detect tool call loops: if the same tool fails repeatedly, abort
-	if err := detectToolLoop(history, &current); err != nil {
-		// Return error by modifying current message to contain the error
-		current.Content = fmt.Sprintf("Tool loop detected: %v. Please try a different approach.", err)
-		// Clear tool results and tools to avoid malformed request
-		current.UserInputMessageContext = nil
-		
-		// Remove the last assistant message with tool calls from history
-		// to avoid orphaned tool calls without results
-		if len(history) > 0 {
-			last := history[len(history)-1]
-			if last.AssistantResponseMessage != nil && len(last.AssistantResponseMessage.ToolUses) > 0 {
-				history = history[:len(history)-1]
-			}
-		}
-	}
-
 	return history, current
 }
 
@@ -549,153 +532,13 @@ func appendToolResult(results []toolResult, toolUseID, text string) []toolResult
 		return results
 	}
 	
-	status := "success"
-	if isToolError(text) {
-		status = "error"
-	}
-	
 	return append(results, toolResult{
 		ToolUseID: toolUseID,
-		Status:    status,
+		Status:    "success",
 		Content: []toolResultContent{
 			{Text: text},
 		},
 	})
-}
-
-func isToolError(text string) bool {
-	// Detect tool execution error patterns
-	// These patterns match actual error messages from the tool execution layer,
-	// not arbitrary tool output that happens to mention these words.
-	errorPrefixes := []string{
-		"SchemaError(",
-		"ValidationError(",
-		"The todowrite tool was called with invalid",
-		"tool was called with invalid arguments",
-		"Missing key at",
-	}
-	for _, prefix := range errorPrefixes {
-		if strings.HasPrefix(text, prefix) {
-			return true
-		}
-	}
-	
-	// Check if first line starts with common error indicators
-	firstLine := text
-	if idx := strings.Index(text, "\n"); idx > 0 {
-		firstLine = text[:idx]
-	}
-	firstLine = strings.TrimSpace(firstLine)
-	
-	// Only match if error/failed appears at the very start
-	lowerFirst := strings.ToLower(firstLine)
-	if strings.HasPrefix(lowerFirst, "error:") || 
-	   strings.HasPrefix(lowerFirst, "error ") ||
-	   strings.HasPrefix(lowerFirst, "failed:") ||
-	   strings.HasPrefix(lowerFirst, "failed ") {
-		return true
-	}
-	
-	return false
-}
-
-func detectToolLoop(history []conversationEntry, current *userInputMessage) error {
-	const maxConsecutiveErrors = 3
-	
-	// Track consecutive tool call errors
-	var consecutiveErrors int
-	var lastToolName string
-	var lastToolInput string
-	
-	// Check current message first (most recent)
-	if current != nil && current.UserInputMessageContext != nil {
-		hasError := false
-		for _, result := range current.UserInputMessageContext.ToolResults {
-			if result.Status == "error" {
-				hasError = true
-				break
-			}
-		}
-		// If current has errors, we need to check if it's part of a loop
-		if hasError {
-			// Look backwards through history to find the tool call that generated this error
-			for i := len(history) - 1; i >= 0; i-- {
-				entry := history[i]
-				if entry.AssistantResponseMessage != nil && len(entry.AssistantResponseMessage.ToolUses) > 0 {
-					for _, toolUse := range entry.AssistantResponseMessage.ToolUses {
-						inputJSON, _ := json.Marshal(toolUse.Input)
-						inputStr := string(inputJSON)
-						
-						if lastToolName == "" {
-							// First tool call we're examining
-							lastToolName = toolUse.Name
-							lastToolInput = inputStr
-							consecutiveErrors = 1
-						} else if toolUse.Name == lastToolName && inputStr == lastToolInput {
-							consecutiveErrors++
-							if consecutiveErrors >= maxConsecutiveErrors {
-								return fmt.Errorf("tool '%s' called %d times with same failing arguments", toolUse.Name, consecutiveErrors)
-							}
-						} else {
-							// Different tool or input, stop checking
-							return nil
-						}
-					}
-					break
-				}
-			}
-		}
-	}
-	
-	// Continue checking history for patterns
-	for i := len(history) - 1; i >= 0; i-- {
-		entry := history[i]
-		
-		// Check for assistant message with tool uses
-		if entry.AssistantResponseMessage != nil && len(entry.AssistantResponseMessage.ToolUses) > 0 {
-			for _, toolUse := range entry.AssistantResponseMessage.ToolUses {
-				// Serialize input for comparison
-				inputJSON, _ := json.Marshal(toolUse.Input)
-				inputStr := string(inputJSON)
-				
-				// If this is the same tool with same input as last error, increment counter
-				if toolUse.Name == lastToolName && inputStr == lastToolInput {
-					consecutiveErrors++
-					if consecutiveErrors >= maxConsecutiveErrors {
-						return fmt.Errorf("tool '%s' called %d times with same failing arguments", toolUse.Name, consecutiveErrors)
-					}
-				} else if lastToolName != "" {
-					// Different tool or input, reset counter
-					lastToolName = toolUse.Name
-					lastToolInput = inputStr
-					consecutiveErrors = 1
-				} else {
-					lastToolName = toolUse.Name
-					lastToolInput = inputStr
-					consecutiveErrors = 1
-				}
-			}
-		}
-		
-		// Check for user message with tool results
-		if entry.UserInputMessage != nil && entry.UserInputMessage.UserInputMessageContext != nil {
-			hasError := false
-			for _, result := range entry.UserInputMessage.UserInputMessageContext.ToolResults {
-				if result.Status == "error" {
-					hasError = true
-					break
-				}
-			}
-			// If no errors in results, reset the counter
-			if !hasError {
-				consecutiveErrors = 0
-				lastToolName = ""
-				lastToolInput = ""
-			}
-		}
-	}
-	
-	return nil
 }
 
 func parseToolInput(raw string) map[string]any {

@@ -148,6 +148,10 @@ func streamEventStreamToSSE(
 					}
 					seenToolCalls[toolCall.ID] = true
 					sawToolCall = true
+					debugJSON(ctx, "kiro stream tool use event",
+						toolCall,
+						"model", modelID,
+					)
 
 					delta := map[string]any{
 						"tool_calls": []map[string]any{

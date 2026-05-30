@@ -1,6 +1,7 @@
 package kiro
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -115,6 +116,89 @@ func TestDeterministicConversationID(t *testing.T) {
 	second := transformRequest(req, "claude-sonnet-4.6", nil)
 	if first.ConversationState.ConversationID != second.ConversationState.ConversationID {
 		t.Fatalf("expected stable conversation ids, got %q vs %q", first.ConversationState.ConversationID, second.ConversationState.ConversationID)
+	}
+}
+
+func TestBuildToolSpecsNormalizesVerboseSchemasForKiro(t *testing.T) {
+	tools := []sdk.ChatTool{
+		{
+			Type: "function",
+			Function: &sdk.ChatToolFunction{
+				Name: "todowrite",
+				Description: "Create and maintain a structured task list for the current coding session. " +
+					"Tracks progress, organizes multi-step work, and surfaces status to the user.\n\n" +
+					"Use proactively when there are 3+ steps.",
+				Parameters: map[string]any{
+					"$schema": "https://json-schema.org/draft/2020-12/schema",
+					"type":    "object",
+					"title":   "Todo Write",
+					"properties": map[string]any{
+						"todos": map[string]any{
+							"type":        "array",
+							"description": "The updated todo list for the current session with enough detail to execute accurately and keep the user informed.",
+							"items": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"content":  map[string]any{"type": "string", "description": "Task text"},
+									"status":   map[string]any{"type": "string", "enum": []any{"pending", "in_progress", "completed", "cancelled"}},
+									"priority": map[string]any{"type": "string", "default": "medium"},
+								},
+								"required": []any{"content", "status", "priority"},
+							},
+						},
+					},
+					"required": []any{"todos"},
+				},
+			},
+		},
+	}
+
+	specs := buildToolSpecs(tools)
+	if len(specs) != 1 {
+		t.Fatalf("expected one tool spec, got %d", len(specs))
+	}
+
+	spec := specs[0].ToolSpecification
+	if !spec.Strict {
+		t.Fatalf("expected strict mode to be enabled")
+	}
+	if !strings.Contains(spec.Description, `"todos"`) || !strings.Contains(spec.Description, "Always include the todos array") {
+		t.Fatalf("expected todowrite description to spell out required payload, got %q", spec.Description)
+	}
+
+	schema := spec.InputSchema.JSON
+	if _, ok := schema["$schema"]; ok {
+		t.Fatalf("expected $schema to be removed, got %#v", schema)
+	}
+	if _, ok := schema["title"]; ok {
+		t.Fatalf("expected title to be removed, got %#v", schema)
+	}
+	if schema["additionalProperties"] != false {
+		t.Fatalf("expected top-level additionalProperties=false, got %#v", schema["additionalProperties"])
+	}
+
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected properties object, got %#v", schema["properties"])
+	}
+	todos, ok := props["todos"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected todos schema, got %#v", props["todos"])
+	}
+	items, ok := todos["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected todos.items schema, got %#v", todos["items"])
+	}
+	itemProps, ok := items["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected nested properties, got %#v", items["properties"])
+	}
+	priority, ok := itemProps["priority"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected priority schema, got %#v", itemProps["priority"])
+	}
+	if _, ok := priority["default"]; ok {
+		t.Fatalf("expected default to be removed from nested schema, got %#v", priority)
 	}
 }
 

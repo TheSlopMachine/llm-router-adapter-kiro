@@ -1,11 +1,14 @@
 package kiro
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -53,6 +56,12 @@ func transformRequest(
 		}
 	}
 
+	debugJSON(context.Background(), "kiro transformed request",
+		out,
+		"model", modelName,
+		"messages", len(req.Messages),
+		"tools", len(req.Tools),
+	)
 	return out
 }
 
@@ -199,6 +208,15 @@ func convertMessages(messages []sdk.ChatMessage, tools []sdk.ChatTool, modelName
 		}
 	}
 
+	// Detect tool call loops: if the same tool fails repeatedly, abort
+	if err := detectToolLoop(history); err != nil {
+		// Return error by modifying current message to contain the error
+		current.Content = fmt.Sprintf("Tool loop detected: %v. Please try a different approach.", err)
+		if current.UserInputMessageContext != nil {
+			current.UserInputMessageContext.Tools = nil
+		}
+	}
+
 	return history, current
 }
 
@@ -278,22 +296,242 @@ func buildToolSpecs(tools []sdk.ChatTool) []toolSpec {
 		if description == "" {
 			description = "Tool: " + name
 		}
-		if len(inputSchema) == 0 {
-			inputSchema = map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			}
-		}
+		description = normalizeToolDescription(name, description, inputSchema)
+		inputSchema = normalizeToolSchema(inputSchema)
 
 		specs = append(specs, toolSpec{
 			ToolSpecification: toolSpecification{
 				Name:        name,
 				Description: description,
 				InputSchema: inputSchemaBody{JSON: inputSchema},
+				Strict:      true,
 			},
 		})
 	}
 	return specs
+}
+
+var whitespaceRE = regexp.MustCompile(`\s+`)
+
+func normalizeToolDescription(name, description string, schema map[string]any) string {
+	name = strings.TrimSpace(name)
+	description = strings.TrimSpace(description)
+	if name == "" {
+		return description
+	}
+
+	if strings.EqualFold(name, "todowrite") {
+		return `Write or update the todo list. Required input: {"todos":[{"content":"task","status":"pending|in_progress|completed|cancelled","priority":"high|medium|low"}]}. Always include the todos array.`
+	}
+
+	if description == "" {
+		return "Tool: " + name
+	}
+
+	description = whitespaceRE.ReplaceAllString(description, " ")
+	if sentence := firstSentence(description); sentence != "" {
+		description = sentence
+	}
+
+	required := extractRequiredProperties(schema)
+	if len(required) > 0 && !strings.Contains(strings.ToLower(description), "required") {
+		description += " Required fields: " + strings.Join(required, ", ") + "."
+	}
+
+	const maxLen = 280
+	if len(description) > maxLen {
+		description = strings.TrimSpace(description[:maxLen-3]) + "..."
+	}
+	return description
+}
+
+func firstSentence(s string) string {
+	for _, sep := range []string{". ", "\n", "\r"} {
+		if idx := strings.Index(s, sep); idx > 0 {
+			return strings.TrimSpace(s[:idx+1])
+		}
+	}
+	return strings.TrimSpace(s)
+}
+
+func extractRequiredProperties(schema map[string]any) []string {
+	required, ok := schema["required"]
+	if !ok {
+		return nil
+	}
+	names := toStringSlice(required)
+	if len(names) == 0 {
+		return nil
+	}
+	slices.Sort(names)
+	return names
+}
+
+func normalizeToolSchema(schema map[string]any) map[string]any {
+	if len(schema) == 0 {
+		return map[string]any{
+			"type":                 "object",
+			"properties":           map[string]any{},
+			"additionalProperties": false,
+		}
+	}
+
+	normalized := normalizeSchemaNode(schema)
+	out, ok := normalized.(map[string]any)
+	if !ok || len(out) == 0 {
+		return map[string]any{
+			"type":                 "object",
+			"properties":           map[string]any{},
+			"additionalProperties": false,
+		}
+	}
+	if _, ok := out["type"]; !ok {
+		out["type"] = "object"
+	}
+	if _, ok := out["properties"]; !ok && out["type"] == "object" {
+		out["properties"] = map[string]any{}
+	}
+	if _, ok := out["additionalProperties"]; !ok && out["type"] == "object" {
+		out["additionalProperties"] = false
+	}
+	return out
+}
+
+func normalizeSchemaNode(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any)
+		for key, raw := range v {
+			switch key {
+			case "type", "format", "pattern", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+				"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties",
+				"uniqueItems", "const", "nullable":
+				out[key] = raw
+			case "description":
+				if text := compactSchemaText(raw); text != "" {
+					out[key] = text
+				}
+			case "enum":
+				if items := normalizeSchemaArray(raw, false); len(items) > 0 {
+					out[key] = items
+				}
+			case "required":
+				if items := toStringSlice(raw); len(items) > 0 {
+					out[key] = items
+				}
+			case "properties", "$defs", "definitions":
+				if props := normalizeSchemaProperties(raw); len(props) > 0 && key == "properties" {
+					out[key] = props
+				}
+			case "items", "additionalProperties":
+				if child := normalizeSchemaNode(raw); child != nil {
+					out[key] = child
+				} else if boolVal, ok := raw.(bool); ok {
+					out[key] = boolVal
+				}
+			case "anyOf", "oneOf", "allOf":
+				if items := normalizeSchemaArray(raw, true); len(items) > 0 {
+					out[key] = items
+				}
+			}
+		}
+		return out
+	case []any:
+		return normalizeSchemaArray(v, true)
+	default:
+		return value
+	}
+}
+
+func normalizeSchemaProperties(raw any) map[string]any {
+	props, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]any, len(props))
+	for key, value := range props {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		child := normalizeSchemaNode(value)
+		switch typed := child.(type) {
+		case map[string]any:
+			if len(typed) > 0 {
+				out[key] = typed
+			}
+		default:
+			if child != nil {
+				out[key] = child
+			}
+		}
+	}
+	return out
+}
+
+func normalizeSchemaArray(raw any, objectsOnly bool) []any {
+	items, ok := raw.([]any)
+	if !ok {
+		if strings, ok := raw.([]string); ok {
+			out := make([]any, 0, len(strings))
+			for _, item := range strings {
+				out = append(out, item)
+			}
+			return out
+		}
+		return nil
+	}
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		normalized := normalizeSchemaNode(item)
+		if normalized == nil {
+			continue
+		}
+		if objectsOnly {
+			if obj, ok := normalized.(map[string]any); ok && len(obj) > 0 {
+				out = append(out, obj)
+			}
+			continue
+		}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+func compactSchemaText(raw any) string {
+	text, ok := raw.(string)
+	if !ok {
+		return ""
+	}
+	text = whitespaceRE.ReplaceAllString(strings.TrimSpace(text), " ")
+	const maxLen = 160
+	if len(text) > maxLen {
+		text = strings.TrimSpace(text[:maxLen-3]) + "..."
+	}
+	return text
+}
+
+func toStringSlice(raw any) []string {
+	values, ok := raw.([]any)
+	if !ok {
+		if strings, ok := raw.([]string); ok {
+			return slices.Clone(strings)
+		}
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		text, ok := value.(string)
+		if !ok {
+			continue
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		out = append(out, text)
+	}
+	return out
 }
 
 func appendToolResult(results []toolResult, toolUseID, text string) []toolResult {
@@ -302,13 +540,109 @@ func appendToolResult(results []toolResult, toolUseID, text string) []toolResult
 	if toolUseID == "" && text == "" {
 		return results
 	}
+	
+	status := "success"
+	if isToolError(text) {
+		status = "error"
+	}
+	
 	return append(results, toolResult{
 		ToolUseID: toolUseID,
-		Status:    "success",
+		Status:    status,
 		Content: []toolResultContent{
 			{Text: text},
 		},
 	})
+}
+
+func isToolError(text string) bool {
+	// Detect tool execution error patterns
+	// These patterns match actual error messages from the tool execution layer,
+	// not arbitrary tool output that happens to mention these words.
+	errorPrefixes := []string{
+		"SchemaError(",
+		"ValidationError(",
+		"The todowrite tool was called with invalid",
+		"tool was called with invalid arguments",
+		"Missing key at",
+	}
+	for _, prefix := range errorPrefixes {
+		if strings.HasPrefix(text, prefix) {
+			return true
+		}
+	}
+	
+	// Check if first line starts with common error indicators
+	firstLine := text
+	if idx := strings.Index(text, "\n"); idx > 0 {
+		firstLine = text[:idx]
+	}
+	firstLine = strings.TrimSpace(firstLine)
+	
+	// Only match if error/failed appears at the very start
+	lowerFirst := strings.ToLower(firstLine)
+	if strings.HasPrefix(lowerFirst, "error:") || 
+	   strings.HasPrefix(lowerFirst, "error ") ||
+	   strings.HasPrefix(lowerFirst, "failed:") ||
+	   strings.HasPrefix(lowerFirst, "failed ") {
+		return true
+	}
+	
+	return false
+}
+
+func detectToolLoop(history []conversationEntry) error {
+	const maxConsecutiveErrors = 3
+	
+	// Track consecutive tool call errors
+	var consecutiveErrors int
+	var lastToolName string
+	var lastToolInput string
+	
+	for i := len(history) - 1; i >= 0; i-- {
+		entry := history[i]
+		
+		// Check for assistant message with tool uses
+		if entry.AssistantResponseMessage != nil && len(entry.AssistantResponseMessage.ToolUses) > 0 {
+			for _, toolUse := range entry.AssistantResponseMessage.ToolUses {
+				// Serialize input for comparison
+				inputJSON, _ := json.Marshal(toolUse.Input)
+				inputStr := string(inputJSON)
+				
+				// If this is the same tool with same input as last error, increment counter
+				if toolUse.Name == lastToolName && inputStr == lastToolInput {
+					consecutiveErrors++
+					if consecutiveErrors >= maxConsecutiveErrors {
+						return fmt.Errorf("tool '%s' called %d times with same failing arguments", toolUse.Name, consecutiveErrors)
+					}
+				} else {
+					// Different tool or input, reset counter
+					lastToolName = toolUse.Name
+					lastToolInput = inputStr
+					consecutiveErrors = 1
+				}
+			}
+		}
+		
+		// Check for user message with tool results
+		if entry.UserInputMessage != nil && entry.UserInputMessage.UserInputMessageContext != nil {
+			hasError := false
+			for _, result := range entry.UserInputMessage.UserInputMessageContext.ToolResults {
+				if result.Status == "error" {
+					hasError = true
+					break
+				}
+			}
+			// If no errors in results, reset the counter
+			if !hasError {
+				consecutiveErrors = 0
+				lastToolName = ""
+				lastToolInput = ""
+			}
+		}
+	}
+	
+	return nil
 }
 
 func parseToolInput(raw string) map[string]any {

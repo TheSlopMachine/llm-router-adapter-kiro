@@ -186,6 +186,18 @@ func (c *Client) Generate(
 	if state.finishReason == "" {
 		state.finishReason = "stop"
 	}
+	debugJSON(ctx, "kiro parsed response",
+		map[string]any{
+			"content":            state.content.String(),
+			"prompt_tokens":      state.promptTokens,
+			"completion_tokens":  state.completionTokens,
+			"total_tokens":       state.totalTokens,
+			"finish_reason":      state.finishReason,
+			"tool_calls":         state.toolCalls,
+			"total_content_byte": state.totalContentBytes,
+		},
+		"model", modelID,
+	)
 
 	return &sdk.ChatCompletionResponse{
 		ID:      fmt.Sprintf("kiro-%d", time.Now().UnixNano()),

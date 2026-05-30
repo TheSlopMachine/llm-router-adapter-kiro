@@ -46,6 +46,7 @@ type toolSpecification struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema inputSchemaBody `json:"inputSchema"`
+	Strict      bool            `json:"strict,omitempty"`
 }
 
 type inputSchemaBody struct {

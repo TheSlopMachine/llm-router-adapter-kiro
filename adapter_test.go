@@ -90,10 +90,9 @@ func TestConvertMessagesPreservesToolCallsAndToolResults(t *testing.T) {
 	if got := current.UserInputMessageContext.ToolResults; len(got) != 2 {
 		t.Fatalf("expected two tool results on current message, got %#v", got)
 	}
-	// Tools should NOT be present when there are tool results
-	// Kiro API doesn't accept both tools and toolResults in the same message
-	if got := current.UserInputMessageContext.Tools; len(got) != 0 {
-		t.Fatalf("expected tools to NOT be attached when tool results are present, got %#v", current.UserInputMessageContext.Tools)
+	// Tools MUST be present even when there are tool results – Bedrock requires toolConfig when toolUse/toolResult appear
+	if got := current.UserInputMessageContext.Tools; len(got) == 0 {
+		t.Fatalf("expected tools to be attached even when tool results are present (Bedrock requires toolConfig), got %#v", current.UserInputMessageContext.Tools)
 	}
 	if history[0].UserInputMessage.UserInputMessageContext != nil && len(history[0].UserInputMessage.UserInputMessageContext.Tools) != 0 {
 		t.Fatalf("expected tools to be removed from history for API compatibility, got %#v", history[0].UserInputMessage.UserInputMessageContext)

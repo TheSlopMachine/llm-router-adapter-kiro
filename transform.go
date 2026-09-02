@@ -183,10 +183,7 @@ func convertMessages(messages []sdk.ChatMessage, tools []sdk.ChatTool, modelName
 	if current.ModelID == "" {
 		current.ModelID = modelName
 	}
-	// Copy tools to current message ONLY if there are no tool results
-	// Kiro API doesn't accept both tools and toolResults in the same message
-	hasToolResults := current.UserInputMessageContext != nil && len(current.UserInputMessageContext.ToolResults) > 0
-	if len(tools) > 0 && !hasToolResults && (current.UserInputMessageContext == nil || len(current.UserInputMessageContext.Tools) == 0) {
+	if len(tools) > 0 && (current.UserInputMessageContext == nil || len(current.UserInputMessageContext.Tools) == 0) {
 		if current.UserInputMessageContext == nil {
 			current.UserInputMessageContext = &userInputMessageContext{}
 		}
